@@ -11,75 +11,84 @@ import _thread
 import signal
 import sys
 from pyroute2 import IPRoute
-
-##
-from endpoints import CnxnToServer
-from eventlet import timeout
 from ctypes import *
 import os
 
+##
+from endpoints import CnxnToServer
+from reorder import Reorder
+
 libpacketmod_filename = 'libpacketmod.so'
 libpacketmod_directory = os.path.join(os.getcwd(),libpacketmod_filename) #assume its in the cwd
+
 cdll.LoadLibrary(libpacketmod_directory)
 libpacketmod = CDLL(libpacketmod_directory)
+
+##
+
+WSIZE = 4294967295
 
 SERV_IP = "45.33.83.64"
 SERV_PORT = 5410  # 5410
 TUN_NAME = 'tun0'
-# EXCLUDED_IFC_NAMES = [TUN_NAME, 'lo', 'ens9']
+# EXCLUDED_IFC_NAMES = [TUN_NAME, 'lo', 'wlxc4e984d77fe2']
 # EXCLUDED_IFC_NAMES = [TUN_NAME, 'lo', 'wlp3s0']
 EXCLUDED_IFC_NAMES = [TUN_NAME, 'lo']
 
 SERV_ADDR = ((SERV_IP), SERV_PORT)
-LAST_BUF_ID = 1
-PACKET_BUF = [None]*500
+
 # Find all client interfaces available for use
-curr_ifcs = []
-for ifc in netifaces.interfaces():
-    if ifc in EXCLUDED_IFC_NAMES: continue
-    if netifaces.AF_INET not in netifaces.ifaddresses(ifc): continue  # link has no addr, probably down
-    curr_ifcs.append(ifc)
+def get_usable_interfaces():
+    curr_ifcs = []
+    for ifc in netifaces.interfaces():
+        if ifc in EXCLUDED_IFC_NAMES: continue
+        if netifaces.AF_INET not in netifaces.ifaddresses(ifc): continue  # link has no addr, probably down
+        curr_ifcs.append(ifc)
+    return curr_ifcs
 #bind to avail interfaces
-success = 0 
 
-for interface in curr_ifcs:
-    with timeout.Timeout(3) as timeout:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, (interface.encode('ascii')))
-            s.bind((netifaces.ifaddresses(interface)[netifaces.AF_INET][0]['addr'], 0)) #bind to that ifc ip addr on random port
-            
-            s.connect(SERV_ADDR)
-            s.send(struct.pack("I",12345))
-            data = s.recv(100)
-            s.close()
-            CLIENT_ID = struct.unpack("I",data[0:4])[0]
-            success = 1
-            break
-        except: continue
+CLIENT_ID = None
+for interface in get_usable_interfaces():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, (interface.encode('ascii')))
+        s.bind((netifaces.ifaddresses(interface)[netifaces.AF_INET][0]['addr'], 0)) #bind to that ifc ip addr on random port
 
-if(success==0):
+        s.connect(SERV_ADDR)
+        s.send(struct.pack("I",12345))
+        data = s.recv(100)
+        s.close()
+        CLIENT_ID = struct.unpack("I",data[0:4])[0]
+        break
+    except:
+        pass
+
+if(CLIENT_ID is None):
     print("couldnt connect to server")
     exit()
 
+
+
+
+
 def sigint_handler(*_):
-    print("Sending kill signal to server...")
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    print("created socket")
-    s.connect(SERV_ADDR)
-    print("connect")
-    s.send(struct.pack("II", 54321,CLIENT_ID))
-    print("sent to socket")
-    s.close()
-
-    # shutdown IPDB
+    #rewrite to send out over udp on each socket
     ipr.release()
-    sys.exit(0)
-#signal.signal(signal.SIGINT, sigint_handler)
+    print("Sending kill signal to server...")
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.25)
+        s.connect(SERV_ADDR)
+        s.send(struct.pack("II", 54321,CLIENT_ID))
+        s.close()
+    finally:
+        sys.exit(0)
+signal.signal(signal.SIGINT, sigint_handler)
 
 
 
-server_connection = CnxnToServer(CLIENT_ID,SERV_ADDR)
+server_connection = CnxnToServer(CLIENT_ID,SERV_ADDR, WSIZE)
 
 
 ##SETUP TUN
@@ -114,11 +123,11 @@ def get_ip_header(ip_packet):
 
 
 
-class QOS: #note currently only supports priority of 0 (low) or 1 (high)
+class QOS:
     def __init__(self, priority_filename):
-        self.drop_rate = 0 #drop every x packets, note that 0 means dont drop anything
-        self.counter = 1
-        self.priority_1_packet_last_seen_time = 0
+        self.congenstion_rate = 0
+        self.counter = 0
+        self.priority_packet_last_seen_time = {1:0, 2:0} #for priority 1 and 2
 
         self.priorities = {'dest_addr': {}}
         priority_file = open(priority_filename, 'r')
@@ -129,59 +138,56 @@ class QOS: #note currently only supports priority of 0 (low) or 1 (high)
                 self.priorities['dest_addr'][args] = priority  # arg will just be an ip address
 
     def prioritize(self, ip_packet):
-        ##give the packet a priority
-        priority = 0
+        ##give the packet a priority, default is 3 (lowest priority)
+        priority = 3
         ip_header = get_ip_header(ip_packet)
         if ip_header['dest_ip'] in self.priorities['dest_addr'].keys():
             priority = self.priorities['dest_addr'][ip_header['dest_ip']]
 
-        if priority == 1:
-            self.priority_1_packet_last_seen_time = time.perf_counter()
+        if priority == -1: #low latency packet
+            return -1, ip_packet
+
+        if priority in [1,2]:
+            self.priority_packet_last_seen_time[priority] = time.perf_counter()
             # print("set 1")
 
+        seconds_since_p1_seen = time.perf_counter() - self.priority_packet_last_seen_time[1]
+        seconds_since_p2_seen = time.perf_counter() - self.priority_packet_last_seen_time[2]
+        # print("seconds_since_p1_seen",seconds_since_p1_seen,"seconds_since_p2_seen",seconds_since_p2_seen)
 
-        ###now do nothing, mangle, or drop
-        #we should only start dropping packets if we are in drop rate mode AND we have recently sent priority packets
-        seconds_since_p1_seen = time.perf_counter() - self.priority_1_packet_last_seen_time
-        if self.drop_rate > 0 and seconds_since_p1_seen < 1.5:
-            if priority == 1:
-                 return ip_packet
+        reduced_window = None
 
-            else:
-                if ip_header['protocol'] == 6: #tcp
-                    # tcp_header = ip_packet[ip_header['iph_length']:ip_header['iph_length'] + 20]
-                    rcv_win = struct.unpack("H",ip_packet[ip_header['iph_length']+14:ip_header['iph_length']+16])[0]
-                    print("rcv win is",rcv_win)
-                    # print(ip_header['iph_length'])
-                    
-                    new_ip_packet = bytearray(ip_packet)
-                    new_rcv_win = struct.pack("H",int(rcv_win/priority))
-                    new_ip_packet[ip_header['iph_length'] + 14:ip_header['iph_length'] + 16] = new_rcv_win
-                    #set checksum to 0 for tcp header and ip header
-                    new_ip_packet[ip_header['iph_length'] + 16:ip_header['iph_length'] + 18] = struct.pack("H",0)
-                    rcv_win = struct.unpack("H",new_ip_packet[ip_header['iph_length']+14:ip_header['iph_length']+16])[0]
-                    print("rcv win is",rcv_win)
-                    # new_ip_packet[10:12] = struct.pack("H",0)
-                    # print(new_ip_packet[ip_header['iph_length'] + 16:ip_header['iph_length'] + 18])
-                    new_ip_packet = bytes(new_ip_packet)
-                    libpacketmod.FixChecksums(new_ip_packet,len(new_ip_packet))
-                    print("returning ip packet")
-                    return new_ip_packet
+        if (priority == 2) and (self.congenstion_rate > 0) and (seconds_since_p1_seen < 1.5):
+            reduced_window = 2
+            # print("REDUCTION")
+        if (priority == 3) and (self.congenstion_rate > 0) and ((seconds_since_p1_seen < 1.5) or (seconds_since_p2_seen < 1.5)):
+            reduced_window = 1
+            # print("REDUCTION 1")
 
-            # elif self.counter == self.drop_rate:
-                # self.counter = 1
-                # return None
-            # else:
-            #     self.counter += 1
-            #     return 1
-        # else:
-        #     return ip_packet
-        return ip_packet
+        if reduced_window is not None:
+            if ip_header['protocol'] == 6: #tcp
+                self.counter += 1
+                if self.counter >= 2:
+                    self.counter = 0
+                    return 0, None
 
-    def set_drop_rate(self, drop_rate):
-        self.drop_rate = drop_rate
+                # curr_rcv_win = struct.unpack("H",ip_packet[ip_header['iph_length']+14:ip_header['iph_length']+16])[0]
+                new_ip_packet = bytearray(ip_packet)
+                new_rcv_win = struct.pack("H",reduced_window)
+                # self.zero_window = not self.zero_window
+                new_ip_packet[ip_header['iph_length'] + 14:ip_header['iph_length'] + 16] = new_rcv_win
+                new_ip_packet = bytes(new_ip_packet)
+                libpacketmod.FixChecksums(new_ip_packet, len(new_ip_packet))
+                return 1, new_ip_packet
 
-    
+        return 1, ip_packet
+
+    def set_congenstion(self, congestion_rate):
+        # print("set congestion",congestion_rate)
+        self.congenstion_rate = congestion_rate
+
+
+
 ## SETUP LINKS WITH SOCKETS
 
 
@@ -193,31 +199,41 @@ class IfcLinks:
 
     def update_ifc_links(self):
         #get list of ifcs to use
-        curr_ifcs = []
-        for ifc in netifaces.interfaces():
-            if ifc in EXCLUDED_IFC_NAMES: continue
-            if netifaces.AF_INET not in netifaces.ifaddresses(ifc): continue  # link has no addr, probably down
-            curr_ifcs.append(ifc)
+        curr_ifcs = get_usable_interfaces()
 
-        print("curr ifcs", curr_ifcs)
+        # print("curr ifcs", curr_ifcs)
 
-        ifcs_to_remove = [ifc for ifc in self.ifc_names_to_link_ids.keys() if ifc not in curr_ifcs]
+        # ifcs_to_remove = [ifc for ifc in self.ifc_names_to_link_ids.keys() if ifc not in curr_ifcs]
+
+        #remove from dict if link was deleted
+        ifc_to_remove_from_dict = []
+        for ifc, link_id in self.ifc_names_to_link_ids.items():
+            if link_id not in self.server_connection.links:
+                ifc_to_remove_from_dict.append(ifc)
+        for ifc in ifc_to_remove_from_dict:
+            del self.ifc_names_to_link_ids[ifc]
+
+
         ifcs_to_add = [ifc for ifc in curr_ifcs if ifc not in self.ifc_names_to_link_ids.keys()]
 
-        for ifc in ifcs_to_remove:
-            link_id = self.ifc_names_to_link_ids[ifc]
-            self.server_connection.remove_link(link_id)
-            del self.ifc_names_to_link_ids[ifc]
+        # for ifc in ifcs_to_remove:
+        #     print("deleting",ifc)
+        #     link_id = self.ifc_names_to_link_ids[ifc]
+        #     self.server_connection.remove_link(link_id)
+        #     del self.ifc_names_to_link_ids[ifc]
+
 
         for ifc in ifcs_to_add:
             link_id = self.next_ifc_id
+            print("adding",ifc,link_id)
+            self.ifc_names_to_link_ids[ifc] = link_id
             self.next_ifc_id += 1
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, (ifc.encode('ascii')))
             sock.bind((netifaces.ifaddresses(ifc)[netifaces.AF_INET][0]['addr'], 0)) #bind to that ifc ip addr on random port
             self.server_connection.add_link(link_id,sock=sock)
 
-        self.server_connection.update_link_metrics()
+        self.server_connection.update_link_metrics(self_gen=True)
 
 
 # header format is client_id(uint),interface_id(uint),action_id(uint)
@@ -260,88 +276,97 @@ def link_quality():
     while True:
         time.sleep(0.5)
         server_connection.send_link_quality_update()
-
 _thread.start_new_thread (link_quality,())
 
 
+def keep_alive():
+    while True:
+        time.sleep(0.15)
+        server_connection.send_keep_alives()
+_thread.start_new_thread (keep_alive,())
+
+
+def update_links():
+    while True:
+        time.sleep(0.5)
+        ifc_links.update_ifc_links()
+        update_listen_list()
+_thread.start_new_thread (update_links,())
+
+
+
+reorder = Reorder(tun, WSIZE,trigger=25)
+
 def process_incoming_msg(buf, sock):
-    global LAST_BUF_ID, PACKET_BUF
     #get the link id for the socket that got written to
-    for link_id, link in server_connection.links.items():
+    link_id = None
+    for l_id, link in server_connection.links.items():
         if link.sock is sock:
-            # print('got message on ifc',ifc)
+            link_id = l_id
             break
+    if link_id is None: return
 
     action_id = struct.unpack("I", buf[0:4])[0]
-    if action_id == 100:
-
+    if action_id == 100: #regular data
         buffer_id, packet_id = struct.unpack("II", buf[4:12])
-        #print("buffer id is" ,buffer_id)
-        tun.write(buf[12:])
-        # PACKET_BUF[buffer_id] = buf
-        # diff = buffer_id - LAST_BUF_ID
+        server_connection.recv_packet(link_id,packet_id)
+        reorder.incoming(buffer_id, buf[12:])
 
-        # # if buffer_id < LAST_BUF_ID:
-        # #     tun.write(buf[12:])
-        # if diff > 0 and diff < 2: 
-        #     tun.write(buf[12:])
-        #     LAST_BUF_ID = buffer_id
+    if action_id == 101: #low latency packet
+        tun.write(buf[4:])
 
-        # while LAST_BUF_ID < 500 and PACKET_BUF[LAST_BUF_ID]:
-        #     print("writing packet",LAST_BUF_ID)
-        #     tun.write(PACKET_BUF[buffer_id][12:])
-        #     LAST_BUF_ID += 1
-
-        # if LAST_BUF_ID == 500:
-        #     LAST_BUF_ID = 0
-        #     PACKET_BUF = 500*[None]
-
-
+    if action_id == 105: #keep alive
+        packet_id = struct.unpack("I", buf[4:8])[0]
         server_connection.recv_packet(link_id,packet_id)
 
-        # print("wrote packet to tun, id:",packet_id,"from ifc:",id_num)
-    if action_id == 200:
-        link_quality_update_id = struct.unpack("I",buf[4:8])[0]
+
+    if action_id == 200: #link quality update
+        link_quality_update_id, outbound_fastest_link = struct.unpack("II",buf[4:12])
+        first = server_connection.got_link_quality_update(link_id,link_quality_update_id)
+        if not first: return
+
         l = []
-        for i in range(8, len(buf), 12):
-            link_id, rcv_start_id, rcv_count = struct.unpack('III', buf[i:i + 12])
-            l.append((link_id, rcv_start_id, rcv_count))
-        server_connection.update_link_metrics(l)
-
-        server_connection.got_link_quality_update(link_id,link_quality_update_id)
-
-        if server_connection.congestion_mode == 1:
-            # print("congestion mode 1")
-            qos.set_drop_rate(2)
-        else:
-            qos.set_drop_rate(0)
+        for i in range(12, len(buf), 16):
+            link_id, rcv_start_id, rcv_count, rcv_finish_id = struct.unpack('IIII', buf[i:i + 16])
+            l.append((link_id, rcv_start_id, rcv_count, rcv_finish_id))
+        server_connection.update_link_metrics(l, outbound_fastest_link)
+        qos.set_congenstion(server_connection.congestion_mode)
 
 
 ##setup route to direct all traffic thru tun
 ipr = IPRoute()
-#ipr.route('add', dst='default', gateway='10.8.0.1')
+ipr.route('add', dst='default', gateway='10.8.0.1')
 
 
 while True:
-    readable, writable, exceptional = select(listen_list, [], [])
-    if len(exceptional) > 0:
-        ifc_links.update_ifc_links()
+    readable, writable, exceptional = select(listen_list, [], [], 0.15)
+    # if len(exceptional) > 0:
+    #     ifc_links.update_ifc_links()
     for d in readable:
         if d is tun:
+            # print("got from tun ",end='')
             ip_packet = tun.read(tun.mtu)
-            ip_packet = qos.prioritize(ip_packet)
-            if ip_packet is not None:
+            code, ip_packet = qos.prioritize(ip_packet)
+            if code == -1: #low latency packet
+                server_connection.send_ll_packet(ip_packet)
+            elif code == 1:
                 # print("sent")
                 server_connection.send_packet(ip_packet)
+            # server_connection.send_packet(ip_packet)
             # else:
                 # print("dropped",priority)
 
         else:  # d is some socket
+            # print("got from sock", end='')
             buf, addr = d.recvfrom(1500)
             if addr != SERV_ADDR:
                 # print("Got packet from wrong addr", addr)
                 continue
             process_incoming_msg(buf, d)
+
+    if len(readable) == len(writable) == len(exceptional) == 0: #assume this means we timed out
+        print("force empty")
+        reorder.empty_buffer()
 
 
 
