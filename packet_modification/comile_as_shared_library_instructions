@@ -1,0 +1,7 @@
+gcc -c -fPIC -o libpacketmod.o libpacketmod.c
+gcc -shared -fPIC -Wl,-soname,libpacketmod.so -o libpacketmod.so libpacketmod.o -lc
+
+
+now check with
+nm -D --defined-only libpacketmod.so 
+should see your function names (and some other ones)
