@@ -1,0 +1,35 @@
+To use this, the server must be started on the linode cloud server, and then the client can be run on your machine.
+Also the C module could potentially need to be recompiled, see its separate readme.
+
+Step 1. Install python dependencies
+pytun
+netifaces
+pyroute2
+dpkt
+
+
+Step 2. Start server
+Once the client starts, it will route all traffic over the tun interface, which will break any ssh connections.
+Thus to be able to see the server running at the same time, you need to add a static route to the cloud server
+over a default route.
+E.G. on eecs:
+  sudo ip route add 45.33.83.64 via 10.245.154.1
+After this, ssh to the server:
+  ssh root@45.33.83.64
+The password is:  comp112project1
+Then cd and start the server
+  cd proj1new
+  python3 server.py
+
+Step 3.
+In a new terminal, start the client.
+  python3 client.py
+Or to use the (faster) low latency always mode, do:
+  python3 client.py ll
+At this point all traffic should be over the vpn. You can check your ip at e.g. ipchicken.com
+
+Step 4.
+To see how things are going, in a new terminal run
+  bmon
+If you download a file, you should see some traffic over all your interfaces and the tun interface.
+If you have multiple links, you can try adding/removing them and tcp connections should survive.
