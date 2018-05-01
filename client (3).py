@@ -13,11 +13,17 @@ import sys
 from pyroute2 import IPRoute
 from ctypes import *
 import os
-from dpkt import Packet
 
-##
+
+from packet_stuff import get_ip_header, unpack_udp_header, RTP
 from endpoints import CnxnToServer
 from reorder import Reorder
+
+
+LL_ONLY = False
+if len(sys.argv) > 1 and sys.argv[1] == 'll': LL_ONLY = True
+
+
 
 libpacketmod_filename = 'libpacketmod.so'
 libpacketmod_directory = os.path.join(os.getcwd(),libpacketmod_filename) #assume its in the cwd
@@ -25,35 +31,19 @@ libpacketmod_directory = os.path.join(os.getcwd(),libpacketmod_filename) #assume
 cdll.LoadLibrary(libpacketmod_directory)
 libpacketmod = CDLL(libpacketmod_directory)
 
-
-_VERSION_MASK= 0xC000
-_P_MASK     = 0x2000
-_X_MASK     = 0x1000
-_CC_MASK    = 0x0F00
-_M_MASK     = 0x0080
-_PT_MASK    = 0x007F
-_VERSION_SHIFT=14
-_P_SHIFT    = 13
-_X_SHIFT    = 12
-_CC_SHIFT   = 8
-_M_SHIFT    = 7
-_PT_SHIFT   = 0
-
-VERSION = 2
-flows = {}
-
 ##
 
-WSIZE = 4294967295
 
 SERV_IP = "45.33.83.64"
 SERV_PORT = 5410  # 5410
+TCP_PORT = 5411
 TUN_NAME = 'tun0'
 # EXCLUDED_IFC_NAMES = [TUN_NAME, 'lo', 'wlxc4e984d77fe2']
 # EXCLUDED_IFC_NAMES = [TUN_NAME, 'lo', 'wlp3s0']
 EXCLUDED_IFC_NAMES = [TUN_NAME, 'lo']
 
 SERV_ADDR = ((SERV_IP), SERV_PORT)
+TCP_ADDR = (SERV_IP, TCP_PORT)
 
 # Find all client interfaces available for use
 def get_usable_interfaces():
@@ -73,7 +63,7 @@ for interface in get_usable_interfaces():
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, (interface.encode('ascii')))
         s.bind((netifaces.ifaddresses(interface)[netifaces.AF_INET][0]['addr'], 0)) #bind to that ifc ip addr on random port
 
-        s.connect(SERV_ADDR)
+        s.connect(TCP_ADDR)
         s.send(struct.pack("I",12345))
         data = s.recv(100)
         s.close()
@@ -86,6 +76,10 @@ if(CLIENT_ID is None):
     print("couldnt connect to server")
     exit()
 
+
+
+
+
 def sigint_handler(*_):
     #rewrite to send out over udp on each socket
     ipr.release()
@@ -93,7 +87,7 @@ def sigint_handler(*_):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(0.25)
-        s.connect(SERV_ADDR)
+        s.connect(TCP_ADDR)
         s.send(struct.pack("II", 54321,CLIENT_ID))
         s.close()
     finally:
@@ -102,7 +96,7 @@ signal.signal(signal.SIGINT, sigint_handler)
 
 
 
-server_connection = CnxnToServer(CLIENT_ID,SERV_ADDR, WSIZE)
+server_connection = CnxnToServer(CLIENT_ID,SERV_ADDR)
 
 
 ##SETUP TUN
@@ -116,71 +110,13 @@ tun.netmask = '255.255.255.0'
 tun.mtu = 1400
 tun.up()
 
+#### Packet priority i
+#read in file with format filter_type, arg, priority number
 
-# from https://github.com/kbandla/dpkt to parse the contents of an RTP packet
-class RTP(Packet):
-    __hdr__ = (
-        ('_type', 'H',      0x8000),
-        ('seq',     'H',    0),
-        ('ts',      'I',    0),
-        ('ssrc',    'I',    0),
-    )
-    csrc = ''
 
-    def _get_version(self): return (self._type&_VERSION_MASK)>>_VERSION_SHIFT
-    def _set_version(self, ver):
-        self._type = (ver << _VERSION_SHIFT) | (self._type & ~_VERSION_MASK)
-    def _get_p(self): return (self._type & _P_MASK) >> _P_SHIFT
-    def _set_p(self, p): self._type = (p << _P_SHIFT) | (self._type & ~_P_MASK)
-    def _get_x(self): return (self._type & _X_MASK) >> _X_SHIFT
-    def _set_x(self, x): self._type = (x << _X_SHIFT) | (self._type & ~_X_MASK)
-    def _get_cc(self): return (self._type & _CC_MASK) >> _CC_SHIFT
-    def _set_cc(self, cc): self._type = (cc<<_CC_SHIFT)|(self._type&~_CC_MASK)
-    def _get_m(self): return (self._type & _M_MASK) >> _M_SHIFT
-    def _set_m(self, m): self._type = (m << _M_SHIFT) | (self._type & ~_M_MASK)
-    def _get_pt(self): return (self._type & _PT_MASK) >> _PT_SHIFT
-    def _set_pt(self, m): self._type = (m << _PT_SHIFT)|(self._type&~_PT_MASK)
 
-    version = property(_get_version, _set_version)
-    p = property(_get_p, _set_p)
-    x = property(_get_x, _set_x)
-    cc = property(_get_cc, _set_cc)
-    m = property(_get_m, _set_m)
-    pt = property(_get_pt, _set_pt)
 
-    def __len__(self):
-        return self.__hdr_len__ + len(self.csrc) + len(self.data)
-
-    def __str__(self):
-        return self.pack_hdr() + self.csrc + str(self.data)
-
-    def unpack(self, buf):
-        super(RTP, self).unpack(buf)
-        self.csrc = buf[self.__hdr_len__:self.__hdr_len__ + self.cc * 4]
-        self.data = buf[self.__hdr_len__ + self.cc * 4:]
-
-def unpack_udp_header(ip_payload):
-    udph = struct.unpack('!HHHH',ip_payload[0:8])
-    src = udph[0]
-    dst = udph[1]
-    length = udph[2]
-    check = udph[3]
-    return {'source': src, 'destination': dst, 'length': length, 'check': check}
-
-def get_ip_header(ip_packet):
-    #partly from https://www.binarytides.com/python-packet-sniffer-code-linux/
-    iph = struct.unpack('!BBHHHBBH4s4s', ip_packet[0:20])
-    version_ihl = iph[0]
-    version = version_ihl >> 4
-    ihl = version_ihl & 0xF
-    iph_length = ihl * 4
-    tos = iph[2]
-    ttl = iph[5]
-    protocol = iph[6]
-    s_addr = socket.inet_ntoa(iph[8])
-    d_addr = socket.inet_ntoa(iph[9])
-    return {'version':version, 'iph_length':iph_length, 'tos': tos, 'ttl':ttl,'protocol':protocol,'src_ip':s_addr,'dest_ip':d_addr}
-
+flows = {}
 def is_RTP_packet(ip_header, udp_header, udp_payload):
     possible_rtp = RTP(udp_payload)
     srcip = ip_header['src_ip']
@@ -189,11 +125,10 @@ def is_RTP_packet(ip_header, udp_header, udp_payload):
     dstport = udp_header['destination']
     if (srcip, dstip, srcport, dstport) in flows:
       flows[(srcip, dstip, srcport, dstport)][0] += 1
-    else: 
+    else:
       flows[(srcip, dstip, srcport, dstport)] = [1,0]
-    print ("The VOIP ratio for this flow is: " + float(ratio[1])/float(ratio[0]))
-    if possible_rtp._get_version() == 2: 
-        if possible_rtp._get_pt() >=96:
+    if possible_rtp._get_version() == 2:
+        if possible_rtp._get_pt() >=100:
             flows[(srcip, dstip, srcport, dstport)][1] += 1
             ratio = flows[(srcip, dstip, srcport, dstport)]
             if float(ratio[1])/float(ratio[0]) >= 0.5:
@@ -202,13 +137,12 @@ def is_RTP_packet(ip_header, udp_header, udp_payload):
     return False
 
 
-#### Packet priority i
-#read in file with format filter_type, arg, priority number
+
 class QOS:
     def __init__(self, priority_filename):
         self.congenstion_rate = 0
         self.counter = 0
-        self.priority_packet_last_seen_time = {1:0, 2:0} #for priority 1 and 2
+        self.priority_packet_last_seen_time = {1: 0, 2: 0}  # for priority 1 and 2
 
         self.priorities = {'dest_addr': {}}
         priority_file = open(priority_filename, 'r')
@@ -222,25 +156,24 @@ class QOS:
         ##give the packet a priority, default is 3 (lowest priority)
         priority = 3
         ip_header = get_ip_header(ip_packet)
-        
-        #check if its a udp packet - for RTP filtering
+
+        # check if its a udp packet - for RTP filtering
         if ip_header['protocol'] == 17:
             ip_payload = ip_packet[ip_header['iph_length']:]
             udp_header = unpack_udp_header(ip_payload)
             udp_payload = ip_payload[8:]
             if udp_header['source'] >= 1023 and udp_header['destination'] >= 1023:
-                if len(udp_payload)>=12:
+                if len(udp_payload) >= 12:
                     if is_RTP_packet(ip_header, udp_header, udp_payload):
                         return -1, ip_packet
 
         if ip_header['dest_ip'] in self.priorities['dest_addr'].keys():
             priority = self.priorities['dest_addr'][ip_header['dest_ip']]
-   
 
-        if priority == -1: #low latency packet
+        if priority == -1:  # low latency packet
             return -1, ip_packet
 
-        if priority in [1,2]:
+        if priority in [1, 2]:
             self.priority_packet_last_seen_time[priority] = time.perf_counter()
             # print("set 1")
 
@@ -253,12 +186,13 @@ class QOS:
         if (priority == 2) and (self.congenstion_rate > 0) and (seconds_since_p1_seen < 1.5):
             reduced_window = 2
             # print("REDUCTION")
-        if (priority == 3) and (self.congenstion_rate > 0) and ((seconds_since_p1_seen < 1.5) or (seconds_since_p2_seen < 1.5)):
+        if (priority == 3) and (self.congenstion_rate > 0) and (
+                (seconds_since_p1_seen < 1.5) or (seconds_since_p2_seen < 1.5)):
             reduced_window = 1
             # print("REDUCTION 1")
 
         if reduced_window is not None:
-            if ip_header['protocol'] == 6: #tcp
+            if ip_header['protocol'] == 6:  # tcp
                 self.counter += 1
                 if self.counter >= 2:
                     self.counter = 0
@@ -266,7 +200,7 @@ class QOS:
 
                 # curr_rcv_win = struct.unpack("H",ip_packet[ip_header['iph_length']+14:ip_header['iph_length']+16])[0]
                 new_ip_packet = bytearray(ip_packet)
-                new_rcv_win = struct.pack("H",reduced_window)
+                new_rcv_win = struct.pack("H", reduced_window)
                 # self.zero_window = not self.zero_window
                 new_ip_packet[ip_header['iph_length'] + 14:ip_header['iph_length'] + 16] = new_rcv_win
                 new_ip_packet = bytes(new_ip_packet)
@@ -280,18 +214,46 @@ class QOS:
         self.congenstion_rate = congestion_rate
 
 
-
-## SETUP LINKS WITH SOCKETS
-
-
 class IfcLinks:
     def __init__(self, server_connection: CnxnToServer):
         self.ifc_names_to_link_ids = {}
+        self.tcp_socks_to_link_id = {}
         self.next_ifc_id = 0
         self.server_connection = server_connection
 
+    def get_tcp_socks(self):
+        return [s for s in self.tcp_socks_to_link_id if s.fileno() != -1]
+
+    def remove_link(self, link_id=None, ifc_name=None, tcp_sock=None):
+        if link_id is None:
+            if ifc_name in self.ifc_names_to_link_ids:
+                link_id = self.ifc_names_to_link_ids[ifc_name]
+            if tcp_sock in self.tcp_socks_to_link_id:
+                link_id = self.tcp_socks_to_link_id[tcp_sock]
+
+        if link_id is None:
+            print("error removing link")
+            return
+
+        if ifc_name is None:
+            for ifc, lid in self.ifc_names_to_link_ids.items():
+                if lid == link_id:
+                    ifc_name = ifc
+        if tcp_sock is None:
+            for s, lid in self.tcp_socks_to_link_id.items():
+                if lid == link_id:
+                    tcp_sock = s
+
+        if tcp_sock in self.tcp_socks_to_link_id:
+            del self.tcp_socks_to_link_id[tcp_sock]
+
+        if ifc_name in self.ifc_names_to_link_ids:
+            del self.ifc_names_to_link_ids[ifc_name]
+
+        self.server_connection.remove_link(link_id)
+
     def update_ifc_links(self):
-        #get list of ifcs to use
+        #get list of ifcs to useifc_to_remove_from_dict
         curr_ifcs = get_usable_interfaces()
 
         # print("curr ifcs", curr_ifcs)
@@ -318,35 +280,26 @@ class IfcLinks:
 
         for ifc in ifcs_to_add:
             link_id = self.next_ifc_id
-            print("adding",ifc,link_id)
+            print("adding",ifc)
             self.ifc_names_to_link_ids[ifc] = link_id
             self.next_ifc_id += 1
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, (ifc.encode('ascii')))
             sock.bind((netifaces.ifaddresses(ifc)[netifaces.AF_INET][0]['addr'], 0)) #bind to that ifc ip addr on random port
-            self.server_connection.add_link(link_id,sock=sock)
+            # _, port = sock.getsockname()
 
-        self.server_connection.update_link_metrics(self_gen=True)
+            ##initiate tcp connection on this link with the server
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, (ifc.encode('ascii')))
+            s.bind((netifaces.ifaddresses(ifc)[netifaces.AF_INET][0]['addr'],0))
+            # s.settimeout(0.25)
+            s.connect(TCP_ADDR)
+            s.send(struct.pack("III", 1, CLIENT_ID, link_id))
+            self.tcp_socks_to_link_id[s] = link_id
+            self.server_connection.add_link(link_id,sock=sock, tcp_sock=s)
+            print("done adding, link id:",link_id)
 
 
-# header format is client_id(uint),interface_id(uint),action_id(uint)
-# for packet, after header have packet_id(uint) followed by packet
-##actions: 200=introduce link, 100=packet to fwd
-
-##from server, header should just have action
-# if action is 100 will then have packet id
-
-#
-# #todo: do you really neet to introduce the links???
-# ## INTRODUCE LINKS
-# def introduce_link(ifc_name):
-#     sock = links[ifc_name]['sock']
-#     msg = struct.pack("III",CLIENT_ID,links[ifc_name]['id'],200)
-#     for _ in range(5):
-#         sock.sendto(msg,SERV_ADDR)
-#
-# for ifc, d in links.items():
-#     introduce_link(ifc)
 
 
 qos = QOS('priority')
@@ -354,85 +307,63 @@ ifc_links = IfcLinks(server_connection)
 ifc_links.update_ifc_links()
 
 
-listen_list = []
-def update_listen_list():
-    listen_list.clear()
-    for link in server_connection.links.values():
-        listen_list.append(link.sock)
-    listen_list.append(tun)
-update_listen_list()
-
-print("listen_list:", listen_list)
-
-
-def link_quality():
-    while True:
-        time.sleep(0.5)
-        server_connection.send_link_quality_update()
-_thread.start_new_thread (link_quality,())
-
-
-def keep_alive():
-    while True:
-        time.sleep(0.15)
-        server_connection.send_keep_alives()
-_thread.start_new_thread (keep_alive,())
-
-
-def update_links():
-    while True:
-        time.sleep(0.5)
-        ifc_links.update_ifc_links()
-        update_listen_list()
-_thread.start_new_thread (update_links,())
-
-
-
-reorder = Reorder(tun, WSIZE,trigger=25)
+reorder = Reorder(tun)
 
 def process_incoming_msg(buf, sock):
     #get the link id for the socket that got written to
     link_id = None
-    for l_id, link in server_connection.links.items():
+    for link in server_connection.links.values():
         if link.sock is sock:
-            link_id = l_id
+            link_id = link.link_id
             break
     if link_id is None: return
 
-    action_id = struct.unpack("I", buf[0:4])[0]
-    if action_id == 100: #regular data
-        buffer_id, packet_id = struct.unpack("II", buf[4:12])
-        server_connection.recv_packet(link_id,packet_id)
-        reorder.incoming(buffer_id, buf[12:])
+    # print("got on link,",link_id)
 
-    if action_id == 101: #low latency packet
-        tun.write(buf[4:])
+    bucket_id, action_id = struct.unpack("BB",buf[0:2])
+    # print("---->",bucket_id,action_id,link_id)
+    server_connection.count_packet_rcvd(link_id,bucket_id,len(buf))
 
-    if action_id == 105: #keep alive
-        packet_id = struct.unpack("I", buf[4:8])[0]
-        server_connection.recv_packet(link_id,packet_id)
+    if action_id == 10 or action_id == 11: #regular data or low latency packet
+        reorder.got_pkt(buf[2:])
+        # tun.write(buf[2:])
+        # reorder.incoming(buffer_id, buf[12:])
 
+    elif action_id == 20: #link quality update
+        link_quality_update_id, bucket_id = struct.unpack("II", buf[2:10])
+        link_qualities = []
+        for i in range(10, len(buf), 8):
+            lid, rcv_amount = struct.unpack('II', buf[i:i + 8])
+            link_qualities.append((lid, rcv_amount))
 
-    if action_id == 200: #link quality update
-        link_quality_update_id, outbound_fastest_link = struct.unpack("II",buf[4:12])
-        first = server_connection.got_link_quality_update(link_id,link_quality_update_id)
-        if not first: return
+        server_connection.got_link_metrics(link_id, link_quality_update_id, bucket_id, link_qualities)
 
-        l = []
-        for i in range(12, len(buf), 16):
-            link_id, rcv_start_id, rcv_count, rcv_finish_id = struct.unpack('IIII', buf[i:i + 16])
-            l.append((link_id, rcv_start_id, rcv_count, rcv_finish_id))
-        server_connection.update_link_metrics(l, outbound_fastest_link)
         qos.set_congenstion(server_connection.congestion_mode)
+
+    elif action_id == 21: #link quality update
+        link_quality_update_id = struct.unpack("I", buf[2:6])[0]
+        link_qualities = []
+        for i in range(6, len(buf), 4):
+            lid = struct.unpack('I', buf[i:i + 4])[0]
+            link_qualities.append(lid)
+        server_connection.got_latency_metrics(link_id, link_quality_update_id, link_qualities)
 
 
 ##setup route to direct all traffic thru tun
 ipr = IPRoute()
 ipr.route('add', dst='default', gateway='10.8.0.1')
 
+TICK_WAIT = 0.05
+last_tick_time = time.perf_counter()
+last_tf_time = time.perf_counter()
+
 
 while True:
-    readable, writable, exceptional = select(listen_list, [], [], 0.15)
+    # print("..")
+    tcp_socks = list(ifc_links.get_tcp_socks())
+    udp_socks = [link.sock for link in server_connection.links.values()]
+    rlist = [tun]+tcp_socks+udp_socks
+    readable, writable, exceptional = select(rlist, [], rlist, TICK_WAIT)
     # if len(exceptional) > 0:
     #     ifc_links.update_ifc_links()
     for d in readable:
@@ -440,16 +371,16 @@ while True:
             # print("got from tun ",end='')
             ip_packet = tun.read(tun.mtu)
             code, ip_packet = qos.prioritize(ip_packet)
-            if code == -1: #low latency packet
+            if LL_ONLY or code == -1: #low latency packet
                 server_connection.send_ll_packet(ip_packet)
             elif code == 1:
-                # print("sent")
                 server_connection.send_packet(ip_packet)
+
             # server_connection.send_packet(ip_packet)
             # else:
                 # print("dropped",priority)
 
-        else:  # d is some socket
+        elif d in udp_socks:  # d is some socket
             # print("got from sock", end='')
             buf, addr = d.recvfrom(1500)
             if addr != SERV_ADDR:
@@ -457,9 +388,35 @@ while True:
                 continue
             process_incoming_msg(buf, d)
 
-    if len(readable) == len(writable) == len(exceptional) == 0: #assume this means we timed out
-        #print("force empty")
-        reorder.empty_buffer()
+        elif d in tcp_socks:
+            data = d.recv(500)
+
+    for d in exceptional:
+        if d is tun:
+            print("error with tun ifc")
+            exit()
+
+        # elif d in udp_socks:
+        #     ifc_links.remove_link()
+
+        if d in tcp_socks:
+            ifc_links.remove_link(tcp_socks)
+
+
+    curr_time = time.perf_counter()
+
+
+    if curr_time - last_tick_time >= TICK_WAIT:
+        # go_tick()
+        reorder.clear_if_timeout()
+        last_tick_time = curr_time
+
+    if curr_time - last_tf_time >= 0.3:
+        # go_tick()
+        server_connection.actions_to_take_every_tf()
+        ifc_links.update_ifc_links()
+
+        last_tf_time = curr_time
 
 
 
